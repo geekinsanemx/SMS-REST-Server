@@ -4,17 +4,18 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-This is a **SMS REST Server** project that provides a comprehensive REST API service for sending SMS messages via GSM modem using the gammu library. It's a production-ready Python Flask application with systemd integration for Linux systems.
+This is a **SMS REST Server** project (v1.1.7) that provides a comprehensive REST API service for sending SMS messages via GSM modem using the gammu library. It's a production-ready Python Flask application with systemd integration for Linux systems.
 
 ## Core Architecture
 
 ### Main Components
 
-- **`sms_rest_service.py`** - The main Flask REST API server (1540+ lines) with comprehensive SMS functionality including persistent modem connections, automatic port detection, and enhanced error handling
-- **`create_htpasswd.py`** - Simple bcrypt password hashing utility for authentication file creation
-- **`test_ctrl_c.py`** - Signal handling test utility for verifying Ctrl+C behavior
-- **`requirements.txt`** - Python dependencies (Flask, bcrypt, pyserial, python-gammu)
+- **`sms-rest-server.py`** - The main Flask REST API server with comprehensive SMS functionality
+- **Auth helper** (`sms-rest-server.py --create-htpasswd/--update-htpasswd`) - manage bcrypt-hashed authentication files
+- **`test_ctrl_c.py`** - Signal handling test utility
+- **`requirements.txt`** - Python dependencies file
 - **`SMS_REST_README.md`** - Complete user documentation and API reference
+- **`CLAUDE.md`** - This file (project guidance for Claude Code)
 
 ### Technology Stack
 
@@ -24,70 +25,58 @@ This is a **SMS REST Server** project that provides a comprehensive REST API ser
 - **Service Management**: systemd integration for Linux systems
 - **Communication**: REST API with JSON request/response format
 
-### Key Architectural Patterns
-
-- **Persistent Modem Connection**: Global modem connection (`global_modem`) to avoid re-initialization overhead
-- **Intelligent Modem Initialization**: Automatic port detection, ModemManager conflict handling, and configuration management
-- **Error Tuple Pattern**: SMS operations return `(success: bool, status: str, details: str)` tuples
-- **Case-Insensitive API**: JSON field names converted to lowercase for flexible client integration
-- **Signal Handling**: Proper cleanup with SIGINT/SIGTERM handlers for graceful shutdown
-
 ## Key Features
 
-- Send SMS via REST API with JSON format
-- Automatic GSM modem port detection and configuration
+- Send SMS via REST API with standardized JSON response format
+- Automatic GSM modem port detection with smart config validation
 - ModemManager conflict handling (automatic stop/start)
-- SMS reply waiting capability (configurable timeout)
-- Message length validation and auto-truncation
+- SMS reply waiting with complete inbox scanning (prevents missing replies)
+- Message length validation and auto-truncation (160 chars)
 - Phone number normalization for Mexican +52 country code
-- Persistent modem connections to eliminate re-initialization overhead
-- Comprehensive error handling and logging
+- Persistent modem connections (eliminates re-initialization overhead)
+- Automatic SMS inbox cleanup on startup (prevents old message confusion)
+- Standardized logging output with [PREFIX] format for easy parsing
+- Comprehensive error handling with machine-readable error codes
 - Health check endpoint for monitoring
+- Config file support (/etc/default/sms-rest-server)
 
-## Development Commands
+## Common Development Tasks
 
-### Installing Dependencies
+### Running the Service
+
 ```bash
-pip install -r requirements.txt
+# Development mode with debug
+python3 sms-rest-server.py --port 18180 --htpasswd /path/to/htpasswd --debug
+
+# Production mode with specific device
+python3 sms-rest-server.py --port 18180 --htpasswd /path/to/htpasswd --device /dev/ttyUSB0
+
+# Using config file
+python3 sms-rest-server.py --config /etc/default/sms-rest-server
 ```
 
-### Development Mode
-```bash
-# Basic development with debug logging
-python3 sms_rest_service.py --port 18180 --htpasswd /path/to/htpasswd --debug
+### Installing as System Service
 
-# With specific modem device
-python3 sms_rest_service.py --port 18180 --htpasswd /path/to/htpasswd --device /dev/ttyUSB0 --debug
+```bash
+# Install with prerequisites check and systemd integration
+sudo python3 sms-rest-server.py --install
 ```
 
-### Production Installation
+### Creating Authentication Files
+
 ```bash
-# One-command system installation with prerequisites check
-sudo python3 sms_rest_service.py --install
+# Create new htpasswd file (prompts for password twice)
+python3 sms-rest-server.py --create-htpasswd /path/to/htpasswd admin
+
+# Add additional users
+python3 sms-rest-server.py --update-htpasswd /path/to/htpasswd username
 ```
 
-### Authentication Management
-```bash
-# Create new htpasswd file (overwrites existing)
-python3 create_htpasswd.py admin passw0rd /path/to/htpasswd
+### Testing Signal Handling
 
-# Create htpasswd for system service
-python3 create_htpasswd.py admin passw0rd /etc/sms-rest/htpasswd
-```
-
-### Testing and Validation
 ```bash
-# Test signal handling (Ctrl+C behavior)
+# Test Ctrl+C and signal handling
 python3 test_ctrl_c.py
-
-# Health check endpoint
-curl http://localhost:18180/health
-
-# SMS sending test
-curl -X POST http://localhost:18180/ \
-     -u admin:passw0rd \
-     -H "Content-Type: application/json" \
-     -d '{"number": "1234567890", "message": "Test SMS"}'
 ```
 
 ## Dependencies
@@ -104,22 +93,41 @@ Required packages:
 - pyserial >= 3.5
 - python-gammu >= 3.2
 
+System packages (Debian/Ubuntu):
+```bash
+sudo apt-get install python3-gammu python3-flask python3-bcrypt python3-serial
+```
+
 ## Configuration
 
 ### Default Settings
 
-- **Port**: 18180 (configurable with `--port`)
-- **SMS Reply Timeout**: 60 seconds (`SMS_REPLY_TIMEOUT` constant)
+- **Port**: 18180 (configurable with `--port` or config file)
+- **SMS Reply Timeout**: 60 seconds (configurable with `timeout` field in request, max 600s)
+- **SMS Check Interval**: 5 seconds (during reply waiting)
 - **Message Length Limit**: 160 characters (auto-truncated)
 
 ### Command Line Options
 
 - `--port PORT` - Service port (default: 18180)
-- `--htpasswd FILE` - Authentication file path (required)
+- `--htpasswd FILE` - Authentication file path (required unless in config)
 - `--device DEVICE` - Specific modem device (e.g., /dev/ttyUSB0)
+- `--config FILE` - Load configuration from file
 - `--debug` - Enable detailed logging
 - `--install` - System installation with prerequisites check
+- `--create-htpasswd FILE USER [PASS]` - Create/update htpasswd entries (prompts if PASS omitted)
+- `--update-htpasswd FILE USER [PASS]` - Alias for the same behavior
 - `--help` - Show usage information
+
+### Configuration File
+
+Default: `/etc/default/sms-rest-server`
+
+Format: `KEY=VALUE` (shell-style)
+
+Supported keys: `PORT`, `HTPASSWD_FILE`, `DEVICE`, `DEBUG`
+
+Priority: CLI arguments > --config file > /etc/default/sms-rest-server > defaults
 
 ## API Endpoints
 
@@ -127,9 +135,20 @@ Required packages:
 - **Authentication**: Basic HTTP Auth
 - **Content-Type**: application/json
 - **Fields** (case-insensitive):
-  - `number`: Phone number (10-15 digits)
-  - `message`: SMS text (max 160 chars)
+  - `number`: Phone number (10 digits, optional +52 prefix)
+  - `message`: SMS text (max 160 chars, auto-truncated)
   - `reply`: Boolean, wait for reply (optional, default: false)
+  - `timeout`: Reply timeout in seconds (optional, default: 60, max: 600)
+
+**Response Format (v1.1.7):**
+- Standardized JSON with industry-standard fields
+- `status`: 'sent', 'delivered', 'timeout', 'failed'
+- `message_id`: UUID v4 for message tracking
+- `timestamp`: ISO-8601 UTC timestamp
+- `reply`: Object with `text`, `received_at`, `elapsed_seconds` (if reply requested)
+- `meta`: Metadata like truncation info (if applicable)
+- `error_code`: Machine-readable error code (if failed)
+- `error_message`: Human-readable error description (if failed)
 
 ### GET /health (Health Check)
 - Returns service status and timestamp
@@ -146,92 +165,67 @@ Required packages:
 ## System Integration
 
 ### Systemd Service
-- **Service file**: `/etc/systemd/system/sms-rest.service`
-- **Binary location**: `/usr/local/bin/sms-rest-service`
-- **Config directory**: `/etc/sms-rest/`
-- **Auth file**: `/etc/sms-rest/htpasswd`
+- **Installation directory**: `/usr/local/SMS-REST-Server/`
+- **Service script**: `/usr/local/SMS-REST-Server/sms-rest-server.py`
+- **Service file**: `/etc/systemd/system/sms-rest-server.service`
+- **Config file**: `/etc/default/sms-rest-server`
+- **Data directory**: `/var/lib/sms-rest-server/`
+- **Auth file**: `/var/lib/sms-rest-server/htpasswd`
 
 ### Service Management Commands
 ```bash
-sudo systemctl start sms-rest      # Start service
-sudo systemctl stop sms-rest       # Stop service
-sudo systemctl enable sms-rest     # Enable auto-start
-sudo systemctl status sms-rest     # Check status
-sudo journalctl -u sms-rest -f     # View logs
+sudo systemctl start sms-rest-server      # Start service
+sudo systemctl stop sms-rest-server       # Stop service
+sudo systemctl enable sms-rest-server     # Enable auto-start
+sudo systemctl status sms-rest-server     # Check status
+sudo journalctl -u sms-rest-server -f     # View logs
 ```
 
 ## Important Code Patterns
 
 ### Persistent Modem Connections
-The service maintains a global modem connection (`global_modem`) to avoid re-initialization overhead. Always use `get_modem_connection()` function (lines 832-856) to access the modem, which handles automatic reconnection if needed. Never directly access `global_modem`.
+The service maintains a global modem connection (`global_modem`) to avoid re-initialization overhead. Always use `get_modem_connection()` to access the modem, which handles automatic reconnection if needed.
 
-### Error Handling Pattern
-SMS operations consistently return tuples: `(success: bool, status: str, details: str)`. Check the success flag first, then handle specific error types:
-- `timeout` - SMS sending timeout
-- `device_error` - Modem hardware issues  
-- `permission_error` - Access permission problems
-- `failed` - General SMS sending failure
+### SMS Reply Handling (CRITICAL)
+**Pattern from program_gps_device.py - DO NOT MODIFY**
 
-### Modem Initialization Sequence
-The intelligent modem initialization (`init_modem_intelligent()`, lines 286-408) follows this pattern:
-1. Check for specific device parameter first
-2. Test existing ~/.gammurc configuration
-3. Handle ModemManager conflicts by stopping/starting service
-4. Auto-detect modem port using AT commands
-5. Create/update gammu configuration
-6. Initialize and cleanup existing SMS messages
+Three-phase architecture (NEVER process during iteration):
+1. **Collection**: `get_sms_with_locations()` - Iterates through COMPLETE inbox
+2. **Processing**: `check_gps_device_reply()` - Filters by phone + timestamp
+3. **Action**: Delete matched message and return
 
-### Request Processing Pattern
-API requests follow this validation flow:
-1. Basic HTTP authentication (`authenticate_request()`)
-2. Content-type validation (application/json)
-3. JSON structure validation
-4. Case-insensitive field name conversion (`data_lower = {k.lower(): v for k, v in data.items()}`)
-5. Required field validation
-6. Phone number format validation (10-15 digits)
-7. Message length handling (160 char limit with auto-truncation)
+**Key implementation details:**
+- Uses `GetSMSStatus()` to get total message count
+- Loops with `GetNextSMS()` until all messages retrieved
+- Stores messages in array FIRST, processes AFTER
+- Timestamp filtering: both `sent_timestamp` and SMS datetime use local time (NO timezone conversion)
+- Check interval: 5 seconds (same as program_gps_device.py)
 
-### Logging Output Modes
-- **Debug mode**: Detailed SMS tracking with full message content and structured output
-- **Normal mode**: Concise single-line logging with sender IP tracking
+### Error Handling
+SMS operations return tuples: `(success: bool, status: str, details: str)`. Always check the success flag and handle different error types (timeout, device_error, permission_error, failed).
+
+API responses use machine-readable error codes:
+- `AUTHENTICATION_REQUIRED`, `INVALID_CONTENT_TYPE`, `INVALID_JSON`
+- `MISSING_REQUIRED_FIELDS`, `INVALID_PHONE_NUMBER`
+- `MODEM_NOT_AVAILABLE`, `MODEM_TIMEOUT`, `MODEM_DEVICE_ERROR`
+- `SEND_FAILED`
+
+### Logging Format
+Standardized output with prefixes:
+- `[MODEM]` - Modem initialization/connection
+- `[CLEAN]` - SMS inbox cleanup
+- `[SMS]` - SMS send operations
+- `[REPLY]` - Reply waiting/received
+
+Example: `[SMS] 2025-11-14 01:40:00 | admin (127.0.0.1) → 1234567890 | SUCCESS (reply expected) | 'Test'`
 
 ### Signal Handling
-Proper cleanup is implemented with signal handlers for SIGINT and SIGTERM (`signal_handler()`, line 1272), ensuring modem connections are terminated gracefully via `cleanup_modem()`.
+Proper cleanup is implemented with signal handlers for SIGINT and SIGTERM, ensuring modem connections are terminated gracefully.
 
 ## Security Considerations
 
-- Uses bcrypt for password hashing (`create_htpasswd.py` utility)
-- Basic HTTP authentication required for SMS endpoints
-- Default credentials: admin/passw0rd (change for production)
-- Health endpoint (`/health`) requires no authentication
+- Uses bcrypt for password hashing
+- Basic HTTP authentication required
+- No default credentials are shipped—operators must create htpasswd entries before running the service
 - Consider HTTPS for production deployments
 - Limit network access to trusted sources
-- Service runs as root by default in systemd (required for modem access)
-
-## Development Notes
-
-### Code Organization
-- Main service logic in `sms_rest_service.py` (lines 1-1543)
-- Flask routes: `/` (POST, SMS sending) and `/health` (GET)
-- Global constants: `SERVICE_PORT = 18180`, `SMS_REPLY_TIMEOUT = 60`
-
-### Function Reference
-- `get_modem_connection()` - Get persistent modem connection (lines 832-856)
-- `send_sms()` - Send SMS with verbose logging (lines 480-603)
-- `authenticate_request()` - HTTP Basic Auth validation (lines 1278-1298)
-- `init_modem_intelligent()` - Smart modem initialization (lines 286-408)
-- `check_prerequisites()` - System validation for installation (lines 858-967)
-- `install_service()` - Full system service installation (lines 1036-1258)
-
-### Phone Number Handling
-The service includes Mexican +52 country code normalization:
-- `normalize_phone_number()` - Strips country codes and formatting (lines 686-702)
-- `phone_numbers_match()` - Compares numbers handling +52 variations (lines 704-715)
-
-### Installation System
-The `--install` flag provides comprehensive system installation including:
-- Prerequisites validation (Python version, packages, systemd, USB devices)
-- User confirmation walkthrough
-- Service file creation with security settings
-- Default authentication setup
-- Post-installation guidance
