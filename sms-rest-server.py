@@ -118,8 +118,24 @@ Hardware Requirements:
 Created: 2025-08-25
 Updated: 2025-11-14 (E.164 international format support)
 Author: geekinsanemx (https://github.com/geekinsanemx)
-Version: 1.1.10
+Version: 1.1.13
 Changelog:
+  - 1.1.13 (2025-11-15): Fixed recharge reply matching for 7373
+                        - Recharge replies from PASA TIEMPO (sent to 7373) now matched by device number in text
+                        - Extracts device number from message and checks if present in reply
+                        - Special case handling: to_number='7373' + device_number in reply text
+                        - Matches modem version behavior for recharge confirmations
+  - 1.1.12 (2025-11-15): Fixed balance check reply matching
+                        - Balance replies from Telcel (sent to 333) now matched by 'saldo' in text
+                        - Special case handling: to_number='333' + reply contains 'saldo'
+                        - Matches modem version behavior for balance checks
+  - 1.1.11 (2025-11-15): Enhanced logging with message ID column
+                        - Added message_id column to all SMS send logs
+                        - Added REPLY RECEIVED logging when reply is matched to message
+                        - Added REPLY TIMEOUT logging when message times out waiting
+                        - Added STORE EXPIRED logging when messages are removed from store
+                        - Format: [PREFIX] timestamp | message_id | parties | ACTION | details
+                        - Improved grep/filtering by message ID for operational tracking
   - 1.1.10 (2025-11-14): E.164 international phone number format support
                         - Added LOCAL_COUNTRY_CODE constant (+52 for Mexico, configurable)
                         - Internal format changed to E.164 (+{country_code}{number})
@@ -198,7 +214,7 @@ Changelog:
   - 1.0.0 (2025-08-25): Initial release with installation system
 """
 
-VERSION = "1.1.10"
+VERSION = "1.1.13"
 
 from flask import Flask, request, jsonify
 from werkzeug.security import check_password_hash
@@ -232,7 +248,7 @@ SMS_REPLY_TIMEOUT = 60
 REPLY_POLL_INTERVAL = 5
 TIMEOUT_SWEEP_INTERVAL = 5
 QUEUE_WAIT_SECONDS = 1
-MESSAGE_RETENTION_SECONDS = 24 * 60 * 60  # 24 hours
+MESSAGE_RETENTION_SECONDS = 24 * 60 * 60
 
 modem_device = None
 global_modem = None
@@ -244,7 +260,7 @@ worker_thread = None
 worker_stop_event = threading.Event()
 LOCAL_TIMEZONE = datetime.now().astimezone().tzinfo
 
-OPERATOR_SERVICE_NUMBERS = ['2222', '7373']
+OPERATOR_SERVICE_NUMBERS = ['2222', '7373', '333']
 
 LOCAL_COUNTRY_CODE = '+52'
 ERROR_CODES = {
@@ -390,7 +406,20 @@ def apply_reply_to_message(sender_number, reply_text, sms_datetime):
         for message_id, record in message_store.items():
             if not record.get('requires_reply') or record.get('status') != 'sent':
                 continue
-            if not phone_numbers_match(record.get('to_number'), sender_number):
+
+            to_number = record.get('to_number')
+            message_text = record.get('message', '')
+
+            is_balance_reply = (to_number == '333' and 'saldo' in reply_text.lower())
+
+            is_recharge_reply = False
+            if to_number == '7373':
+                match = re.search(r'\d+', message_text)
+                if match:
+                    device_number = match.group(0)
+                    is_recharge_reply = device_number in reply_text
+
+            if not is_balance_reply and not is_recharge_reply and not phone_numbers_match(to_number, sender_number):
                 continue
 
             sent_at = record.get('sent_at')
@@ -423,13 +452,20 @@ def apply_reply_to_message(sender_number, reply_text, sms_datetime):
             'error_message': None
         })
 
+        msg_id_display = best_id if best_id else "no-msg-id"
+        timestamp = time.strftime('%Y-%m-%d %H:%M:%S')
+        reply_preview = f"'{reply_text[:50]}{'...' if len(reply_text) > 50 else ''}'"
+        from_user = best_record.get('from_user', 'unknown')
+        print(f"[REPLY] {timestamp} | {msg_id_display} | {sender_number} → {from_user} | RECEIVED | {reply_preview} (elapsed: {elapsed}s)")
+
         return best_id
 
 
 def handle_timeouts():
     now = datetime.now(timezone.utc)
+    timestamp = time.strftime('%Y-%m-%d %H:%M:%S')
     with message_lock:
-        for record in message_store.values():
+        for message_id, record in message_store.items():
             if not record.get('requires_reply') or record.get('status') != 'sent':
                 continue
             sent_at = record.get('sent_at')
@@ -444,6 +480,11 @@ def handle_timeouts():
                 record['elapsed_seconds'] = max(elapsed, timeout_window)
                 record['reply_text'] = None
                 record['reply_at'] = None
+
+                msg_id_display = message_id if message_id else "no-msg-id"
+                from_user = record.get('from_user', 'unknown')
+                to_number = record.get('to_number', 'unknown')
+                print(f"[REPLY] {timestamp} | {msg_id_display} | {from_user} → {to_number} | TIMEOUT | waited {timeout_window}s")
 
 
 def poll_incoming_replies(sm):
@@ -481,16 +522,18 @@ def cleanup_expired_messages():
         return
 
     cutoff = datetime.now(timezone.utc) - timedelta(seconds=MESSAGE_RETENTION_SECONDS)
+    timestamp = time.strftime('%Y-%m-%d %H:%M:%S')
     removed = []
     with message_lock:
         for message_id, record in list(message_store.items()):
             created_at = record.get('created_at')
             if created_at and created_at < cutoff:
+                age_hours = int((datetime.now(timezone.utc) - created_at).total_seconds() / 3600)
+                status = record.get('status', 'unknown')
+                msg_id_display = message_id if message_id else "no-msg-id"
+                print(f"[STORE] {timestamp} | {msg_id_display} | EXPIRED | age: {age_hours}h, status: {status}")
                 removed.append(message_id)
                 del message_store[message_id]
-
-    if removed and debug:
-        print(f"[STORE] Expired messages removed: {', '.join(removed)}")
 
 
 def process_send_job(sm, job):
@@ -503,7 +546,8 @@ def process_send_job(sm, job):
         job['message'],
         sender_user=job.get('from_user'),
         source_ip=job.get('client_ip'),
-        reply_expected=job.get('requires_reply', False)
+        reply_expected=job.get('requires_reply', False),
+        message_id=message_id
     )
 
     if sms_success:
@@ -1122,8 +1166,9 @@ def start_modem_manager():
             print(f"Failed to start ModemManager: {e}")
         return False
 
-def send_sms(sm, phone_number, message, sender_user=None, source_ip=None, reply_expected=False):
+def send_sms(sm, phone_number, message, sender_user=None, source_ip=None, reply_expected=False, message_id=None):
     timestamp = time.strftime('%Y-%m-%d %H:%M:%S')
+    msg_id_display = message_id if message_id else "no-msg-id"
 
     try:
         sms_info = {
@@ -1138,55 +1183,51 @@ def send_sms(sm, phone_number, message, sender_user=None, source_ip=None, reply_
 
         reply_status = " (reply expected)" if reply_expected else ""
         message_preview = f"'{message[:50]}{'...' if len(message) > 50 else ''}'"
-        print(f"[SMS] {timestamp} | {sender_info} → {phone_number} | SUCCESS{reply_status} | {message_preview}")
+        print(f"[SMS] {timestamp} | {msg_id_display} | {sender_info} → {phone_number} | SUCCESS{reply_status} | {message_preview}")
 
         return True, "success", "SMS sent successfully"
 
     except gammu.ERR_TIMEOUT as e:
         error_msg = f"Timeout while sending SMS to {phone_number}: {str(e)}"
 
-        # Enhanced verbose output for errors
         sender_info = f"{sender_user or 'system'} ({source_ip})" if source_ip else (sender_user or 'system')
 
         reply_status = " (reply expected)" if reply_expected else ""
         message_preview = f"'{message[:50]}{'...' if len(message) > 50 else ''}'"
-        print(f"[SMS] {timestamp} | {sender_info} → {phone_number} | TIMEOUT{reply_status} | {message_preview}")
+        print(f"[SMS] {timestamp} | {msg_id_display} | {sender_info} → {phone_number} | TIMEOUT{reply_status} | {message_preview}")
 
         return False, "timeout", error_msg
 
     except gammu.ERR_DEVICENOTEXIST as e:
         error_msg = f"Device not found while sending SMS to {phone_number}: {str(e)}"
 
-        # Enhanced verbose output for errors
         sender_info = f"{sender_user or 'system'} ({source_ip})" if source_ip else (sender_user or 'system')
 
         reply_status = " (reply expected)" if reply_expected else ""
         message_preview = f"'{message[:50]}{'...' if len(message) > 50 else ''}'"
-        print(f"[SMS] {timestamp} | {sender_info} → {phone_number} | DEVICE_ERROR{reply_status} | {message_preview}")
+        print(f"[SMS] {timestamp} | {msg_id_display} | {sender_info} → {phone_number} | DEVICE_ERROR{reply_status} | {message_preview}")
 
         return False, "device_error", error_msg
 
     except gammu.ERR_DEVICENOPERMISSION as e:
         error_msg = f"Permission denied while sending SMS to {phone_number}: {str(e)}"
 
-        # Enhanced verbose output for errors
         sender_info = f"{sender_user or 'system'} ({source_ip})" if source_ip else (sender_user or 'system')
 
         reply_status = " (reply expected)" if reply_expected else ""
         message_preview = f"'{message[:50]}{'...' if len(message) > 50 else ''}'"
-        print(f"[SMS] {timestamp} | {sender_info} → {phone_number} | PERMISSION_ERROR{reply_status} | {message_preview}")
+        print(f"[SMS] {timestamp} | {msg_id_display} | {sender_info} → {phone_number} | PERMISSION_ERROR{reply_status} | {message_preview}")
 
         return False, "permission_error", error_msg
 
     except Exception as e:
         error_msg = f"Failed to send SMS to {phone_number}: {str(e)}"
 
-        # Enhanced verbose output for errors
         sender_info = f"{sender_user or 'system'} ({source_ip})" if source_ip else (sender_user or 'system')
 
         reply_status = " (reply expected)" if reply_expected else ""
         message_preview = f"'{message[:50]}{'...' if len(message) > 50 else ''}'"
-        print(f"[SMS] {timestamp} | {sender_info} → {phone_number} | ERROR{reply_status} | {message_preview}")
+        print(f"[SMS] {timestamp} | {msg_id_display} | {sender_info} → {phone_number} | ERROR{reply_status} | {message_preview}")
 
         return False, "failed", error_msg
 
@@ -1382,7 +1423,7 @@ def check_prerequisites():
         current_user = pwd.getpwuid(os.getuid()).pw_name if os.getuid() != 0 else "root"
         try:
             dialout_group = grp.getgrnam('dialout')
-            if os.getuid() == 0:  # Running as root
+            if os.getuid() == 0:
                 print("   ✅ Running as root (has device access)")
             elif current_user in dialout_group.gr_mem:
                 print(f"   ✅ User '{current_user}' is in dialout group")
@@ -1794,7 +1835,6 @@ def send_sms_api():
             http_status=401
         )
 
-    # Validate content type
     if not request.is_json:
         return build_api_response(
             status='failed',
@@ -1804,10 +1844,8 @@ def send_sms_api():
             http_status=400
         )
 
-    # Get request data
     data = request.get_json()
 
-    # Validate required fields
     if not data:
         return build_api_response(
             status='failed',
@@ -1817,16 +1855,13 @@ def send_sms_api():
             http_status=400
         )
 
-    # Make field names case-insensitive by converting to lowercase
     data_lower = {k.lower(): v for k, v in data.items()}
 
-    # Extract fields (even if invalid, for response)
     phone_number = str(data_lower.get('number', '')) if 'number' in data_lower else None
     message = str(data_lower.get('message', '')) if 'message' in data_lower else None
     wait_for_reply = data_lower.get('reply', False)
     reply_timeout = data_lower.get('timeout', SMS_REPLY_TIMEOUT)
 
-    # Check required fields
     required_fields = ['number', 'message']
     missing_fields = [field for field in required_fields if field not in data_lower]
     if missing_fields:
@@ -1840,7 +1875,6 @@ def send_sms_api():
             http_status=400
         )
 
-    # Validate timeout if provided
     if wait_for_reply and reply_timeout:
         try:
             reply_timeout = int(reply_timeout)
@@ -1865,13 +1899,12 @@ def send_sms_api():
                 http_status=400
             )
 
-    # Validate and normalize phone number to E.164 format
     valid, normalized_number, error_msg = validate_and_normalize_phone(phone_number)
 
     if not valid:
         return build_api_response(
             status='failed',
-            to=phone_number,  # Return what user sent
+            to=phone_number,
             from_user=username,
             message_text=message,
             error_code='INVALID_PHONE_NUMBER',
@@ -1879,11 +1912,9 @@ def send_sms_api():
             http_status=400
         )
 
-    # Store original (what user sent) and normalized (E.164) formats
     original_phone_number = phone_number
-    phone_number = normalized_number  # Now in E.164 format (e.g., "+521234567890")
+    phone_number = normalized_number
 
-    # Handle message length limit
     original_message = message
     message_truncated = False
     meta = None
@@ -2004,7 +2035,6 @@ def main():
     port = None
     port_from_cli = False
 
-    # Parse command line arguments
     try:
         opts, args = getopt.getopt(
             sys.argv[1:],
@@ -2019,7 +2049,6 @@ def main():
         print_usage()
         sys.exit(1)
 
-    # Handle special commands first
     for opt, arg in opts:
         if opt in ("-h", "--help"):
             print_usage()
@@ -2044,7 +2073,6 @@ def main():
                 print(f"Error: config file not found: {config_file}")
                 sys.exit(1)
 
-    # Load configuration from file
     config = load_config()
 
     SMS_REPLY_TIMEOUT = get_int_config(config, 'SMS_REPLY_TIMEOUT', SMS_REPLY_TIMEOUT, 1, 600)
@@ -2053,7 +2081,6 @@ def main():
     QUEUE_WAIT_SECONDS = get_int_config(config, 'QUEUE_WAIT_SECONDS', QUEUE_WAIT_SECONDS, 1)
     MESSAGE_RETENTION_SECONDS = get_int_config(config, 'MESSAGE_RETENTION_SECONDS', MESSAGE_RETENTION_SECONDS, 0)
 
-    # Apply configuration values (config file < CLI args)
     for opt, arg in opts:
         if opt in ("-p", "--port"):
             try:
@@ -2077,7 +2104,6 @@ def main():
         elif opt in ("-d", "--debug"):
             debug = True
 
-    # Apply config file values if not overridden by CLI
     if not port_from_cli and 'PORT' in config:
         try:
             port = int(config['PORT'])
@@ -2093,11 +2119,9 @@ def main():
     if not debug and 'DEBUG' in config:
         debug = config['DEBUG'].lower() in ['true', '1', 'yes']
 
-    # Apply final defaults
     if port is None:
         port = SERVICE_PORT
 
-    # Validate required options
     if not htpasswd_file:
         print("Error: --htpasswd option is required (or set HTPASSWD_FILE in config)")
         print("\nYou can:")
@@ -2107,7 +2131,6 @@ def main():
         print_usage()
         sys.exit(1)
 
-    # Print startup information
     modem_info = f"Device: {modem_device}" if modem_device else "Device: Auto-detect"
     config_source = "Default" if not config_file and not os.path.exists('/etc/default/sms-rest-server') else \
                     config_file if config_file else "/etc/default/sms-rest-server"
@@ -2123,13 +2146,10 @@ Debug: {debug}
 =============================
 """)
 
-    # Set up signal handlers for clean shutdown
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
     atexit.register(cleanup_modem)
 
-    # Initialize global modem connection
-    # Skip initialization in Flask's parent reloader process
     if debug and os.environ.get('WERKZEUG_RUN_MAIN') != 'true':
         print("🔄 Flask reloader parent process, modem will be initialized after restart")
     else:
@@ -2144,7 +2164,6 @@ Debug: {debug}
             sys.exit(1)
         start_gsm_worker()
 
-    # Start Flask app
     try:
         app.run(host='0.0.0.0', port=port, debug=debug, use_reloader=debug)
     except KeyboardInterrupt:
