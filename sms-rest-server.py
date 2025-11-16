@@ -118,8 +118,34 @@ Hardware Requirements:
 Created: 2025-08-25
 Updated: 2025-11-14 (E.164 international format support)
 Author: geekinsanemx (https://github.com/geekinsanemx)
-Version: 1.1.13
+Version: 1.1.18
 Changelog:
+  - 1.1.18 (2025-11-15): Fixed htpasswd file ownership during installation
+                        - Set htpasswd file ownership to sms-rest-server:sms-rest-server after creation
+                        - Fixes "Permission denied" error when service tries to read htpasswd
+  - 1.1.17 (2025-11-15): Fixed system user home directory for .gammurc config
+                        - Changed user creation to use --home-dir /var/lib/sms-rest-server --create-home
+                        - Ensures ~/.gammurc resolves to /var/lib/sms-rest-server/.gammurc
+                        - Fixed "No such file or directory" error when service starts
+  - 1.1.16 (2025-11-15): Added --uninstall function to remove service
+                        - Created uninstall_service() function to reverse installation
+                        - Stops and disables systemd service
+                        - Removes service file, config file, and installation directory
+                        - Prompts user for data directory and system user removal
+                        - Added --uninstall option to CLI and help text
+  - 1.1.15 (2025-11-15): Fixed installation password display bug and added dedicated system user
+                        - Fixed undefined 'password' variable bug in installation output (line 1780)
+                        - Created dedicated 'sms-rest-server' system user for service
+                        - Service now runs as sms-rest-server user (not root) for security
+                        - Added user to dialout group for serial port access
+                        - Set proper ownership of /var/lib/sms-rest-server/ directory
+                        - Updated systemd service: User=sms-rest-server, Group=dialout
+                        - Fixed password display to only show when newly created
+  - 1.1.14 (2025-11-15): Added requirements.txt and auto-install for Python dependencies
+                        - Created requirements.txt with all Python package dependencies
+                        - Updated --install to offer automatic pip package installation
+                        - Updated fix_prerequisites_guide() to suggest requirements.txt usage
+                        - Installation now prompts to install missing packages automatically
   - 1.1.13 (2025-11-15): Fixed recharge reply matching for 7373
                         - Recharge replies from PASA TIEMPO (sent to 7373) now matched by device number in text
                         - Extracts device number from message and checks if present in reply
@@ -214,7 +240,7 @@ Changelog:
   - 1.0.0 (2025-08-25): Initial release with installation system
 """
 
-VERSION = "1.1.13"
+VERSION = "1.1.18"
 
 from flask import Flask, request, jsonify
 from werkzeug.security import check_password_hash
@@ -741,6 +767,7 @@ Options:
     --config FILE            Load configuration from file
     --debug                  Enable debug mode
     --install                Install service system-wide
+    --uninstall              Uninstall service (removes systemd service, prompts for data/user removal)
     --create-htpasswd FILE USER [PASS]  Create/update htpasswd entry (prompts for PASS if omitted)
     --update-htpasswd FILE USER [PASS]  Alias for --create-htpasswd
     --help                   Show this help message
@@ -769,6 +796,9 @@ Examples:
 
     # Install as system service
     sudo sms-rest-server.py --install
+
+    # Uninstall system service
+    sudo sms-rest-server.py --uninstall
 
 API Usage:
     # Send SMS without waiting for reply
@@ -820,10 +850,27 @@ def create_htpasswd_file(username, password, output_file):
 
         os.chmod(output_file, 0o600)
 
-        if replaced:
-            print(f"✅ Updated htpasswd entry for '{username}' in {output_file}")
+        if '/var/lib/sms-rest-server' in output_file:
+            try:
+                import pwd
+                sms_user = pwd.getpwnam('sms-rest-server')
+                os.chown(output_file, sms_user.pw_uid, sms_user.pw_gid)
+                if replaced:
+                    print(f"✅ Updated htpasswd entry for '{username}' in {output_file} (ownership: sms-rest-server)")
+                else:
+                    print(f"✅ Added '{username}' to htpasswd file: {output_file} (ownership: sms-rest-server)")
+            except (KeyError, Exception) as e:
+                if replaced:
+                    print(f"✅ Updated htpasswd entry for '{username}' in {output_file}")
+                else:
+                    print(f"✅ Added '{username}' to htpasswd file: {output_file}")
+                print(f"   ⚠️  Could not set ownership to sms-rest-server: {e}")
         else:
-            print(f"✅ Added '{username}' to htpasswd file: {output_file}")
+            if replaced:
+                print(f"✅ Updated htpasswd entry for '{username}' in {output_file}")
+            else:
+                print(f"✅ Added '{username}' to htpasswd file: {output_file}")
+
         return True
     except Exception as e:
         print(f"❌ Error creating htpasswd file: {e}")
@@ -1468,11 +1515,14 @@ def show_installation_walkthrough():
     print("This installation will:")
     print("  1. 📁 Create /usr/local/SMS-REST-Server/ directory")
     print("  2. 📁 Copy sms-rest-server.py and requirements.txt")
-    print("  3. 📁 Create /var/lib/sms-rest-server/ data directory")
-    print("  4. 🔐 Prompt you to create an initial htpasswd user (admin)")
-    print("  5. 📄 Create /etc/default/sms-rest-server config file")
-    print("  6. 🔧 Create /etc/systemd/system/sms-rest-server.service")
-    print("  7. 🔄 Reload systemd daemon")
+    print("  3. 👤 Create system user 'sms-rest-server' (added to dialout group)")
+    print("  4. 📁 Create /var/lib/sms-rest-server/ data directory")
+    print("  5. 🔐 Prompt you to create an initial htpasswd user (admin)")
+    print("  6. 📄 Create /etc/default/sms-rest-server config file")
+    print("  7. 🔧 Create /etc/systemd/system/sms-rest-server.service")
+    print("  8. 🔄 Reload systemd daemon")
+    print()
+    print("⚠️  Note: Service will run as 'sms-rest-server' user (not root)")
     print()
     print("After installation, you can:")
     print("  • Start service: sudo systemctl start sms-rest-server")
@@ -1492,16 +1542,27 @@ def show_installation_walkthrough():
         else:
             print("Please enter 'y' for yes or 'n' for no.")
 
-def fix_prerequisites_guide(missing_packages):
+def fix_prerequisites_guide(missing_packages, script_dir):
     print("\n" + "="*60)
     print("🔧 PREREQUISITES FIX GUIDE")
     print("="*60)
     print()
 
     if missing_packages:
+        requirements_file = os.path.join(script_dir, 'requirements.txt')
+
         print("📦 Install missing Python packages:")
+        print()
+        print("   Option 1 - Install from requirements.txt (recommended):")
+        if os.path.exists(requirements_file):
+            print(f"   pip3 install --break-system-packages -r {requirements_file}")
+        else:
+            print("   requirements.txt not found, use Option 2 or 3")
+        print()
+        print("   Option 2 - Install individually:")
         print(f"   pip3 install --break-system-packages {' '.join(missing_packages)}")
-        print("   # OR using system package manager:")
+        print()
+        print("   Option 3 - Using system package manager:")
         for pkg in missing_packages:
             if pkg == 'Flask':
                 print("   sudo apt-get install python3-flask")
@@ -1535,10 +1596,9 @@ def install_service():
     print("=" * 60)
     print()
 
-    # Step 1: Check prerequisites
+    script_dir = os.path.dirname(os.path.abspath(__file__))
     issues, warnings, missing_packages = check_prerequisites()
 
-    # Show results
     print()
     if warnings:
         print("⚠️  Warnings:")
@@ -1553,10 +1613,32 @@ def install_service():
         print()
 
         if missing_packages:
-            fix_prerequisites_guide(missing_packages)
-
-        print("Please fix the above issues and run the installation again.")
-        sys.exit(1)
+            print("\nWould you like to install missing Python packages now? (y/n): ", end='', flush=True)
+            response = input().strip().lower()
+            if response in ['y', 'yes']:
+                requirements_file = os.path.join(script_dir, 'requirements.txt')
+                if os.path.exists(requirements_file):
+                    print(f"\nInstalling packages from {requirements_file}...")
+                    result = os.system(f'pip3 install --break-system-packages -r "{requirements_file}"')
+                    if result == 0:
+                        print("\n✅ Python packages installed successfully!")
+                        print("Please run the installation again: sudo ./sms-rest-server.py --install")
+                        sys.exit(0)
+                    else:
+                        print("\n❌ Failed to install Python packages")
+                        fix_prerequisites_guide(missing_packages, script_dir)
+                        sys.exit(1)
+                else:
+                    print("\n❌ requirements.txt not found")
+                    fix_prerequisites_guide(missing_packages, script_dir)
+                    sys.exit(1)
+            else:
+                fix_prerequisites_guide(missing_packages, script_dir)
+                print("\nPlease fix the above issues and run the installation again.")
+                sys.exit(1)
+        else:
+            print("Please fix the above issues and run the installation again.")
+            sys.exit(1)
 
     print("✅ All prerequisite checks passed!")
     print()
@@ -1599,21 +1681,65 @@ def install_service():
         else:
             print(f"⚠️  requirements.txt not found in {script_dir}, skipping")
 
-        # 4. Create data directory
+        # 4. Create system user
+        print(f"👤 Creating system user 'sms-rest-server'...")
+        try:
+            pwd.getpwnam('sms-rest-server')
+            print(f"   ℹ️  User 'sms-rest-server' already exists, skipping user creation")
+        except KeyError:
+            result = os.system('useradd --system --home-dir /var/lib/sms-rest-server --create-home --shell /bin/false sms-rest-server')
+            if result != 0:
+                raise Exception("Failed to create system user 'sms-rest-server'")
+            print(f"   ✅ Created system user 'sms-rest-server' (home: /var/lib/sms-rest-server)")
+
+        try:
+            grp.getgrnam('dialout')
+            result = os.system('usermod -a -G dialout sms-rest-server')
+            if result != 0:
+                raise Exception("Failed to add user to dialout group")
+            print(f"   ✅ Added 'sms-rest-server' to dialout group")
+        except KeyError:
+            print(f"   ⚠️  dialout group not found, skipping group assignment")
+
+        # 5. Create data directory
         print(f"📁 Creating data directory {data_dir}")
         os.makedirs(data_dir, exist_ok=True)
         os.chmod(data_dir, 0o755)
 
-        # 5. Create htpasswd file
+        try:
+            sms_user = pwd.getpwnam('sms-rest-server')
+            os.chown(data_dir, sms_user.pw_uid, sms_user.pw_gid)
+            print(f"   ✅ Set ownership to sms-rest-server:sms-rest-server")
+        except Exception as e:
+            print(f"   ⚠️  Could not set ownership: {e}")
+
+        # 6. Create htpasswd file
         username = "admin"
+        htpasswd_created = False
+        admin_pwd = None
         if not os.path.exists(htpasswd_path):
             print(f"🔐 Creating htpasswd file at {htpasswd_path}")
             admin_pwd = prompt_for_password(username)
             create_htpasswd_file(username, admin_pwd, htpasswd_path)
+            htpasswd_created = True
+
+            try:
+                sms_user = pwd.getpwnam('sms-rest-server')
+                os.chown(htpasswd_path, sms_user.pw_uid, sms_user.pw_gid)
+                print(f"   ✅ Set htpasswd ownership to sms-rest-server:sms-rest-server")
+            except Exception as e:
+                print(f"   ⚠️  Could not set htpasswd ownership: {e}")
         else:
             print(f"⚠️  htpasswd file already exists at {htpasswd_path}, skipping")
 
-        # 6. Create config file
+            try:
+                sms_user = pwd.getpwnam('sms-rest-server')
+                os.chown(htpasswd_path, sms_user.pw_uid, sms_user.pw_gid)
+                print(f"   ✅ Validated htpasswd ownership (sms-rest-server:sms-rest-server)")
+            except Exception as e:
+                print(f"   ⚠️  Could not validate htpasswd ownership: {e}")
+
+        # 7. Create config file
         if not os.path.exists(config_file):
             config_content = f"""# SMS REST Server Configuration
 # This file is sourced by systemd service as environment variables
@@ -1657,7 +1783,7 @@ HTPASSWD_FILE={htpasswd_path}
         else:
             print(f"⚠️  Config file already exists at {config_file}, skipping")
 
-        # 7. Create systemd service file
+        # 8. Create systemd service file
         service_content = f"""[Unit]
 Description=SMS REST API Server
 After=network.target
@@ -1665,8 +1791,9 @@ Wants=network.target
 
 [Service]
 Type=simple
-User=root
-Group=root
+User=sms-rest-server
+Group=dialout
+SupplementaryGroups=dialout
 WorkingDirectory={install_dir}
 
 # Load configuration from /etc/default/sms-rest-server
@@ -1696,7 +1823,7 @@ WantedBy=multi-user.target
             f.write(service_content)
         os.chmod(service_file, 0o644)
 
-        # 8. Reload systemd daemon
+        # 9. Reload systemd daemon
         print("🔄 Reloading systemd daemon...")
         os.system('systemctl daemon-reload')
 
@@ -1740,8 +1867,12 @@ WantedBy=multi-user.target
 
         print("🔐 Default Credentials:")
         print(f"   Username: {username}")
-        print(f"   Password: {password}")
-        print("   ⚠️  Change default password for production use!")
+        if htpasswd_created and admin_pwd:
+            print(f"   Password: {admin_pwd}")
+            print("   ⚠️  Save this password - it cannot be retrieved later!")
+        else:
+            print("   Password: (existing htpasswd file, password not shown)")
+            print(f"   ℹ️  To create additional users: {target_script} --create-htpasswd {htpasswd_path} <username>")
         print()
 
         print("🧪 Test the Service:")
@@ -1786,6 +1917,169 @@ WantedBy=multi-user.target
                 os.rmdir(install_dir)
             except:
                 pass
+        sys.exit(1)
+
+def uninstall_service():
+    import shutil
+    import pwd
+    import grp
+
+    print("=" * 60)
+    print(f"🗑️  SMS REST SERVICE UNINSTALLATION v{VERSION}")
+    print("=" * 60)
+    print()
+
+    if os.geteuid() != 0:
+        print("❌ Root privileges required. Run with sudo.")
+        sys.exit(1)
+
+    install_dir = "/usr/local/SMS-REST-Server"
+    service_file = "/etc/systemd/system/sms-rest-server.service"
+    config_file = "/etc/default/sms-rest-server"
+    data_dir = "/var/lib/sms-rest-server"
+
+    service_exists = os.path.exists(service_file)
+    install_exists = os.path.exists(install_dir)
+    config_exists = os.path.exists(config_file)
+    data_exists = os.path.exists(data_dir)
+
+    if not service_exists and not install_exists and not config_exists:
+        print("⚠️  No installation found. Nothing to uninstall.")
+        print()
+        print("Checked locations:")
+        print(f"   • Service file: {service_file}")
+        print(f"   • Installation dir: {install_dir}")
+        print(f"   • Config file: {config_file}")
+        sys.exit(0)
+
+    print("This will remove:")
+    if service_exists:
+        print(f"   • Systemd service: {service_file}")
+    if install_exists:
+        print(f"   • Installation directory: {install_dir}")
+    if config_exists:
+        print(f"   • Config file: {config_file}")
+    print()
+
+    if data_exists:
+        print("⚠️  Optional (will prompt):")
+        print(f"   • Data directory: {data_dir} (contains htpasswd)")
+        print("   • System user: sms-rest-server")
+        print()
+
+    while True:
+        response = input("Proceed with uninstallation? [y/N]: ").lower().strip()
+        if response in ['y', 'yes']:
+            break
+        elif response in ['', 'n', 'no']:
+            print("Uninstallation cancelled.")
+            sys.exit(0)
+        else:
+            print("Please enter 'y' for yes or 'n' for no.")
+
+    print()
+    print("🚀 Starting uninstallation...")
+
+    try:
+        if service_exists:
+            print("🛑 Stopping service (if running)...")
+            result = os.system('systemctl stop sms-rest-server 2>/dev/null')
+            if result == 0:
+                print("   ✅ Service stopped")
+            else:
+                print("   ℹ️  Service was not running")
+
+            print("🔓 Disabling service (if enabled)...")
+            result = os.system('systemctl disable sms-rest-server 2>/dev/null')
+            if result == 0:
+                print("   ✅ Service disabled")
+            else:
+                print("   ℹ️  Service was not enabled")
+
+            print(f"🗑️  Removing service file: {service_file}")
+            os.remove(service_file)
+            print("   ✅ Service file removed")
+
+            print("🔄 Reloading systemd daemon...")
+            os.system('systemctl daemon-reload')
+            print("   ✅ Systemd daemon reloaded")
+
+        if config_exists:
+            print(f"🗑️  Removing config file: {config_file}")
+            os.remove(config_file)
+            print("   ✅ Config file removed")
+
+        if install_exists:
+            print(f"🗑️  Removing installation directory: {install_dir}")
+            shutil.rmtree(install_dir)
+            print("   ✅ Installation directory removed")
+
+        if data_exists:
+            print()
+            while True:
+                response = input(f"Remove data directory {data_dir} (contains htpasswd)? [y/N]: ").lower().strip()
+                if response in ['y', 'yes']:
+                    print(f"🗑️  Removing data directory: {data_dir}")
+                    shutil.rmtree(data_dir)
+                    print("   ✅ Data directory removed")
+                    break
+                elif response in ['', 'n', 'no']:
+                    print(f"   ℹ️  Keeping data directory: {data_dir}")
+                    break
+                else:
+                    print("Please enter 'y' for yes or 'n' for no.")
+
+        try:
+            pwd.getpwnam('sms-rest-server')
+            print()
+            while True:
+                response = input("Remove system user 'sms-rest-server'? [y/N]: ").lower().strip()
+                if response in ['y', 'yes']:
+                    print("🗑️  Removing system user 'sms-rest-server'...")
+                    result = os.system('userdel sms-rest-server 2>/dev/null')
+                    if result == 0:
+                        print("   ✅ System user removed")
+                    else:
+                        print("   ⚠️  Failed to remove system user")
+                    break
+                elif response in ['', 'n', 'no']:
+                    print("   ℹ️  Keeping system user 'sms-rest-server'")
+                    break
+                else:
+                    print("Please enter 'y' for yes or 'n' for no.")
+        except KeyError:
+            pass
+
+        print()
+        print("=" * 60)
+        print("✅ UNINSTALLATION COMPLETED SUCCESSFULLY!")
+        print("=" * 60)
+        print()
+
+        print("📋 Summary:")
+        print("   ✅ Systemd service removed and disabled")
+        print("   ✅ Installation files removed")
+        print()
+
+        if data_exists and os.path.exists(data_dir):
+            print("📁 Remaining Files:")
+            print(f"   • Data directory: {data_dir}")
+            print("     (manually remove if no longer needed)")
+            print()
+
+        try:
+            pwd.getpwnam('sms-rest-server')
+            print("👤 Remaining System User:")
+            print("   • User: sms-rest-server")
+            print("     (manually remove with: sudo userdel sms-rest-server)")
+            print()
+        except KeyError:
+            pass
+
+        print("=" * 60)
+
+    except Exception as e:
+        print(f"❌ Uninstallation failed: {e}")
         sys.exit(1)
 
 def cleanup_modem():
@@ -2041,7 +2335,7 @@ def main():
             "hp:a:D:c:di",
             [
                 "help", "port=", "htpasswd=", "device=", "config=", "debug",
-                "install", "create-htpasswd", "update-htpasswd"
+                "install", "uninstall", "create-htpasswd", "update-htpasswd"
             ]
         )
     except getopt.GetoptError as e:
@@ -2055,6 +2349,9 @@ def main():
             sys.exit(0)
         elif opt == "--install":
             install_service()
+            sys.exit(0)
+        elif opt == "--uninstall":
+            uninstall_service()
             sys.exit(0)
         elif opt in ("--create-htpasswd", "--update-htpasswd"):
             # Expects at least 2 additional arguments: output_file username [password]
