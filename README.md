@@ -4,11 +4,13 @@ A comprehensive REST API service for sending SMS messages via GSM modem using th
 
 ![Python](https://img.shields.io/badge/python-3.8+-blue.svg)
 ![Flask](https://img.shields.io/badge/flask-2.3+-green.svg)
-![Version](https://img.shields.io/badge/version-1.1.8-brightgreen.svg)
+![Version](https://img.shields.io/badge/version-1.1.21-brightgreen.svg)
 
 ## Features
 
 - ✅ **REST API**: Send SMS messages via HTTP POST with JSON request/response
+- ✅ **Inbox Retrieval**: GET /inbox endpoint to read all received SMS messages
+- ✅ **Grafana Integration**: Webhook endpoint for Grafana alertmanager notifications
 - ✅ **Authentication**: Secure Basic HTTP authentication with bcrypt hashing
 - ✅ **Async Reply Tracking**: Queue-based delivery with background GSM polling keeps HTTP requests non-blocking while still capturing replies
 - ✅ **Message Validation**: Automatic length validation and truncation (160 chars)
@@ -18,8 +20,9 @@ A comprehensive REST API service for sending SMS messages via GSM modem using th
 - ✅ **Standardized Logging**: [PREFIX] format for easy parsing and monitoring
 - ✅ **Automatic Cleanup**: SMS inbox cleanup on startup prevents old message confusion
 - ✅ **Health Monitoring**: Built-in health check endpoint for service monitoring
-- ✅ **System Integration**: Complete systemd service installation with proper signal handling
+- ✅ **System Integration**: Complete systemd service installation/uninstallation with proper signal handling
 - ✅ **Production Ready**: Comprehensive error handling with machine-readable error codes
+- ✅ **Config Preservation**: Smart reinstallation preserves existing settings and credentials
 
 ## Quick Start
 
@@ -80,6 +83,21 @@ curl http://localhost:18180/health
 curl -u <user>:<password> "http://localhost:18180/status?message_id=<uuid>"
 ```
 
+**Retrieve Inbox**:
+```bash
+# Get all messages
+curl -u <user>:<password> "http://localhost:18180/inbox"
+
+# Get only unread messages
+curl -u <user>:<password> "http://localhost:18180/inbox?unread"
+
+# Get and delete after reading
+curl -u <user>:<password> "http://localhost:18180/inbox?unread&delete"
+
+# Limit results
+curl -u <user>:<password> "http://localhost:18180/inbox?limit=10"
+```
+
 ## API Reference
 
 ### Endpoints
@@ -88,6 +106,8 @@ curl -u <user>:<password> "http://localhost:18180/status?message_id=<uuid>"
 |--------|----------|---------------|-------------|
 | POST | `/` | ✅ Yes | Queue an SMS send-and-reply job |
 | GET | `/status` | ✅ Yes | Retrieve latest status for a `message_id` |
+| GET | `/inbox` | ✅ Yes | Retrieve all SMS messages from modem inbox |
+| POST | `/api/v1/alerts` | ❌ No | Grafana alertmanager webhook (if enabled) |
 | GET | `/health` | ❌ No | Service health check |
 
 ### Request Format
@@ -108,6 +128,73 @@ curl -u <user>:<password> "http://localhost:18180/status?message_id=<uuid>"
 **Phone Number Formats**:
 - `1234567890` - 10 digits (standard)
 - `+521234567890` - With +52 country code (Mexico)
+
+**GET /inbox** - Retrieve SMS Messages
+
+Query Parameters:
+- `?unread` or `?unread_only=true` - Only return unread messages
+- `?delete` or `?delete_after=true` - Delete messages after retrieval
+- `?limit=N` - Limit number of messages returned
+
+Response:
+```json
+{
+  "status": "success",
+  "count": 2,
+  "messages": [
+    {
+      "number": "+521234567890",
+      "datetime": "2025-11-26T07:30:00",
+      "text": "Message content",
+      "state": "UnRead",
+      "location": 1,
+      "folder": 0
+    }
+  ],
+  "timestamp": "2025-11-26T07:35:00Z"
+}
+```
+
+**POST /api/v1/alerts** - Grafana Webhook
+
+Requires `GRAFANA_WEBHOOK=1` in config file. Accepts Grafana alertmanager webhook format.
+
+Request (Grafana sends JSON array of alerts):
+```json
+[
+  {
+    "labels": {
+      "alertname": "HighCPU",
+      "number": "+521234567890"
+    },
+    "annotations": {
+      "summary": "CPU usage above 80%"
+    },
+    "endsAt": "0001-01-01T00:00:00Z"
+  }
+]
+```
+
+Response:
+```json
+{
+  "status": "completed",
+  "total_alerts": 1,
+  "successful": 1,
+  "failed": 0,
+  "results": [
+    {
+      "alert_index": 1,
+      "alert_name": "HighCPU",
+      "phone_number": "+521234567890",
+      "message_id": "uuid",
+      "status": "FIRING",
+      "success": true
+    }
+  ],
+  "timestamp": "2025-11-26T07:35:00Z"
+}
+```
 
 ### Response Format (v1.1.10)
 
@@ -190,6 +277,7 @@ Options:
   --config FILE            Load configuration from file
   --debug                  Enable debug mode with detailed logging
   --install                Install service system-wide with prerequisites check
+  --uninstall              Uninstall service (prompts for data/user removal)
   --create-htpasswd FILE USER [PASS]  Create/update htpasswd entry (prompts for PASS if omitted)
   --update-htpasswd FILE USER [PASS]  Alias for --create-htpasswd
   --help                   Show help message
@@ -206,6 +294,14 @@ Supported keys:
 - `HTPASSWD_FILE` - Authentication file path
 - `DEVICE` - Modem device path (optional, auto-detect if not set)
 - `DEBUG` - Enable debug mode (true/false)
+- `SMS_REPLY_TIMEOUT` - Reply timeout in seconds (default: 60)
+- `REPLY_POLL_INTERVAL` - Polling interval in seconds (default: 5)
+- `TIMEOUT_SWEEP_INTERVAL` - Timeout sweep interval (default: 5)
+- `QUEUE_WAIT_SECONDS` - Queue wait seconds (default: 1)
+- `MESSAGE_RETENTION_SECONDS` - Message retention window (default: 86400)
+- `GRAFANA_WEBHOOK` - Enable Grafana webhook endpoint (0/1, default: 0)
+- `GRAFANA_DEFAULT_NUMBER` - Default phone for alerts without number label
+- `GRAFANA_MESSAGE_MAX_LENGTH` - Max message length for alerts (default: 150)
 
 **Priority**: CLI arguments > --config file > /etc/default/sms-rest-server > defaults
 
@@ -215,6 +311,11 @@ PORT=18180
 HTPASSWD_FILE=/var/lib/sms-rest-server/htpasswd
 DEVICE=/dev/ttyUSB0
 # DEBUG=true
+
+# Grafana webhook integration
+GRAFANA_WEBHOOK=1
+GRAFANA_DEFAULT_NUMBER=+521234567890
+GRAFANA_MESSAGE_MAX_LENGTH=150
 ```
 
 ## System Service Management
@@ -394,26 +495,41 @@ This ensures **ALL messages are checked** (not just the first one) and prevents 
 
 ## Version History
 
+**v1.1.21 (2025-11-26)**
+- Added GET /inbox endpoint for retrieving SMS messages from modem
+- Query parameters: ?unread, ?delete, ?limit=N
+- Short and long parameter forms supported
+
+**v1.1.20 (2025-11-15)**
+- Config and credential preservation during reinstallation
+- Prompts to preserve or override previous settings
+- Merges old config values into new template
+
+**v1.1.19 (2025-11-15)**
+- Added Grafana webhook integration (POST /api/v1/alerts)
+- Processes Grafana alertmanager webhook JSON arrays
+- Message format: [FIRING/RESOLVED] AlertName: content
+- Configurable with GRAFANA_WEBHOOK, GRAFANA_DEFAULT_NUMBER
+
+**v1.1.18 (2025-11-15)**
+- Fixed htpasswd file ownership during installation
+- Automatic ownership to sms-rest-server:sms-rest-server
+
+**v1.1.17 (2025-11-15)**
+- Fixed system user home directory for .gammurc config
+- Service runs as sms-rest-server user (not root)
+
+**v1.1.16 (2025-11-15)**
+- Added --uninstall function to remove service
+- Prompts for data directory and system user removal
+
 **v1.1.8 (2025-11-14)**
 - CRITICAL: Fixed timezone bug - removed 'Z' suffix from local time timestamps
 - Removed dead code (unused SMS_CHECK_INTERVAL variable)
-- Fixed all documentation inconsistencies (file names, service names, paths)
 
 **v1.1.7 (2025-11-14)**
 - CRITICAL FIX: SMS reply detection now processes ALL inbox messages
-- Fixed timezone mismatch between sent_timestamp and SMS datetime
-- Replaced single GetNextSMS() with complete inbox iteration
 - Standardized logging output with [PREFIX] format
-
-**v1.1.6 (2025-11-13)**
-- Added timestamp-based reply filtering (prevents old stored messages)
-- Smart gammurc validation (reuse existing config if valid)
-- Replaced Python SMS cleanup with gammu CLI (more reliable)
-
-**v1.1.0 (2025-11-13)**
-- Standardized REST API response format (industry standard)
-- Added unique message_id (UUID v4) for message tracking
-- Machine-readable error codes
 
 **v1.0.0 (2025-08-25)**
 - Initial release with systemd integration
