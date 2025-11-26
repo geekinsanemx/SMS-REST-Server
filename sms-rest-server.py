@@ -118,8 +118,29 @@ Hardware Requirements:
 Created: 2025-08-25
 Updated: 2025-11-14 (E.164 international format support)
 Author: geekinsanemx (https://github.com/geekinsanemx)
-Version: 1.1.18
+Version: 1.1.21
 Changelog:
+  - 1.1.21 (2025-11-26): Added inbox retrieval endpoint
+                        - Added GET /inbox endpoint with authentication
+                        - Retrieves all SMS messages from modem inbox
+                        - Query params: ?unread, ?delete, ?limit=N
+                        - Supports short (?unread) and long (?unread_only=true) forms
+                        - Returns structured JSON with sender, datetime, text
+  - 1.1.20 (2025-11-15): Added config and credential preservation during reinstallation
+                        - Installation now detects existing /etc/default/sms-rest-server
+                        - Prompts user to preserve or override previous settings
+                        - Parses old config and merges values into new template
+                        - Preserves existing htpasswd file and validates permissions
+                        - Clean upgrade path without losing configuration
+  - 1.1.19 (2025-11-15): Added Grafana webhook integration for alert notifications
+                        - Added /api/v1/alerts endpoint (conditional on GRAFANA_WEBHOOK config)
+                        - Processes Grafana alertmanager webhook JSON arrays
+                        - Extracts phone number from labels (number/phone/sms_number)
+                        - Message priority: annotations.summary > description > message
+                        - Message format: [FIRING/RESOLVED] AlertName: content
+                        - Truncates messages to 150 chars (configurable GRAFANA_MESSAGE_MAX_LENGTH)
+                        - Config: GRAFANA_WEBHOOK (0/1), GRAFANA_DEFAULT_NUMBER, GRAFANA_MESSAGE_MAX_LENGTH
+                        - Returns structured response with success/failure counts
   - 1.1.18 (2025-11-15): Fixed htpasswd file ownership during installation
                         - Set htpasswd file ownership to sms-rest-server:sms-rest-server after creation
                         - Fixes "Permission denied" error when service tries to read htpasswd
@@ -240,7 +261,7 @@ Changelog:
   - 1.0.0 (2025-08-25): Initial release with installation system
 """
 
-VERSION = "1.1.18"
+VERSION = "1.1.21"
 
 from flask import Flask, request, jsonify
 from werkzeug.security import check_password_hash
@@ -275,6 +296,9 @@ REPLY_POLL_INTERVAL = 5
 TIMEOUT_SWEEP_INTERVAL = 5
 QUEUE_WAIT_SECONDS = 1
 MESSAGE_RETENTION_SECONDS = 24 * 60 * 60
+GRAFANA_WEBHOOK = False
+GRAFANA_DEFAULT_NUMBER = None
+GRAFANA_MESSAGE_MAX_LENGTH = 150
 
 modem_device = None
 global_modem = None
@@ -562,6 +586,117 @@ def cleanup_expired_messages():
                 del message_store[message_id]
 
 
+def process_grafana_alert(alert, alert_index, client_ip, username='grafana'):
+    try:
+        labels = alert.get('labels', {})
+        annotations = alert.get('annotations', {})
+
+        ends_at = alert.get('endsAt', '')
+        status = "FIRING" if ends_at == "0001-01-01T00:00:00Z" else "RESOLVED"
+
+        alert_name = labels.get('alertname', 'Unknown Alert')
+
+        phone_number = None
+        for key in ['number', 'phone', 'sms_number', 'phone_number']:
+            if key in labels and labels[key]:
+                phone_number = str(labels[key]).strip()
+                break
+
+        if not phone_number and GRAFANA_DEFAULT_NUMBER:
+            phone_number = GRAFANA_DEFAULT_NUMBER
+
+        if not phone_number:
+            return {
+                'alert_index': alert_index,
+                'alert_name': alert_name,
+                'success': False,
+                'error': 'No phone number found in alert labels and no default configured'
+            }
+
+        message_content = None
+        for key in ['summary', 'description', 'message']:
+            if key in annotations and annotations[key]:
+                message_content = str(annotations[key]).strip()
+                break
+
+        if not message_content:
+            message_content = "Alert triggered"
+
+        final_message = f"[{status}] {alert_name}: {message_content}"
+
+        max_length = GRAFANA_MESSAGE_MAX_LENGTH
+        original_length = len(final_message)
+        truncated = False
+        if len(final_message) > max_length:
+            final_message = final_message[:max_length]
+            truncated = True
+
+        valid, normalized_number, error_msg = validate_and_normalize_phone(phone_number)
+        if not valid:
+            return {
+                'alert_index': alert_index,
+                'alert_name': alert_name,
+                'phone_number': phone_number,
+                'success': False,
+                'error': f'Invalid phone number: {error_msg}'
+            }
+
+        msg_id = str(uuid.uuid4())
+
+        meta = None
+        if truncated:
+            meta = {
+                'truncated': True,
+                'original_length': original_length,
+                'sent_length': max_length
+            }
+
+        record = create_message_record(
+            msg_id,
+            original_number=phone_number,
+            normalized_number=normalized_number,
+            message_text=final_message,
+            username=username,
+            requires_reply=False,
+            timeout_seconds=None,
+            meta=meta,
+            client_ip=client_ip
+        )
+
+        job_payload = {
+            'message_id': msg_id,
+            'to_number': normalized_number,
+            'message': final_message,
+            'from_user': username,
+            'requires_reply': False,
+            'timeout_seconds': None,
+            'client_ip': client_ip
+        }
+
+        send_queue.put(job_payload)
+
+        return {
+            'alert_index': alert_index,
+            'alert_name': alert_name,
+            'phone_number': phone_number,
+            'message_id': msg_id,
+            'status': status,
+            'truncated': truncated,
+            'success': True
+        }
+
+    except Exception as e:
+        if debug:
+            import traceback
+            traceback.print_exc()
+        return {
+            'alert_index': alert_index,
+            'alert_name': alert.get('labels', {}).get('alertname', 'Unknown'),
+            'success': False,
+            'error': str(e)
+        }
+
+
 def process_send_job(sm, job):
     message_id = job['message_id']
     now = datetime.now(timezone.utc)
@@ -778,7 +913,9 @@ Config File:
     Supported keys: PORT, HTPASSWD_FILE, DEVICE, DEBUG,
                     SMS_REPLY_TIMEOUT, REPLY_POLL_INTERVAL,
                     TIMEOUT_SWEEP_INTERVAL, QUEUE_WAIT_SECONDS,
-                    MESSAGE_RETENTION_SECONDS
+                    MESSAGE_RETENTION_SECONDS,
+                    GRAFANA_WEBHOOK, GRAFANA_DEFAULT_NUMBER,
+                    GRAFANA_MESSAGE_MAX_LENGTH
     Priority: CLI args > --config file > /etc/default/sms-rest-server > defaults
 
 Examples:
@@ -953,6 +1090,68 @@ def get_int_config(config, key, current_value, min_value=None, max_value=None):
     except ValueError:
         print(f"Warning: Invalid value for {key} in config ({raw_value}), keeping {current_value}")
         return current_value
+
+def get_bool_config(config, key, current_value):
+    if key not in config:
+        return current_value
+
+    raw_value = config[key].lower().strip()
+    if raw_value in ['1', 'true', 'yes', 'on', 'enabled']:
+        return True
+    elif raw_value in ['0', 'false', 'no', 'off', 'disabled']:
+        return False
+    else:
+        print(f"Warning: Invalid boolean value for {key} in config ({raw_value}), keeping {current_value}")
+        return current_value
+
+def parse_existing_config(config_path):
+    settings = {}
+    if not os.path.exists(config_path):
+        return settings
+
+    try:
+        with open(config_path, 'r') as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith('#') and '=' in line:
+                    key, value = line.split('=', 1)
+                    key = key.strip()
+                    value = value.strip()
+                    if value.startswith('"') and value.endswith('"'):
+                        value = value[1:-1]
+                    elif value.startswith("'") and value.endswith("'"):
+                        value = value[1:-1]
+                    settings[key] = value
+    except Exception as e:
+        print(f"⚠️  Error parsing existing config: {e}")
+
+    return settings
+
+def merge_config_with_template(old_settings, template):
+    lines = template.split('\n')
+    merged_lines = []
+
+    for line in lines:
+        if '=' in line and not line.strip().startswith('#'):
+            key = line.split('=', 1)[0].strip()
+            if key in old_settings:
+                merged_lines.append(f"{key}={old_settings[key]}")
+            else:
+                merged_lines.append(line)
+        elif line.strip().startswith('#') and '=' in line:
+            comment_part = line.split('=', 1)
+            if len(comment_part) == 2:
+                key_part = comment_part[0].replace('#', '').strip()
+                if key_part in old_settings:
+                    merged_lines.append(f"{key_part}={old_settings[key_part]}")
+                else:
+                    merged_lines.append(line)
+            else:
+                merged_lines.append(line)
+        else:
+            merged_lines.append(line)
+
+    return '\n'.join(merged_lines)
 
 def detect_modem_port():
     print("🔍 Auto-detecting modem port...")
@@ -1730,18 +1929,19 @@ def install_service():
             except Exception as e:
                 print(f"   ⚠️  Could not set htpasswd ownership: {e}")
         else:
-            print(f"⚠️  htpasswd file already exists at {htpasswd_path}, skipping")
+            print(f"⚠️  htpasswd file already exists at {htpasswd_path}")
+            print(f"   ℹ️  Preserving existing authentication credentials")
 
             try:
                 sms_user = pwd.getpwnam('sms-rest-server')
                 os.chown(htpasswd_path, sms_user.pw_uid, sms_user.pw_gid)
-                print(f"   ✅ Validated htpasswd ownership (sms-rest-server:sms-rest-server)")
+                os.chmod(htpasswd_path, 0o600)
+                print(f"   ✅ Validated htpasswd ownership and permissions")
             except Exception as e:
-                print(f"   ⚠️  Could not validate htpasswd ownership: {e}")
+                print(f"   ⚠️  Could not validate htpasswd: {e}")
 
         # 7. Create config file
-        if not os.path.exists(config_file):
-            config_content = f"""# SMS REST Server Configuration
+        config_template = f"""# SMS REST Server Configuration
 # This file is sourced by systemd service as environment variables
 # Format: KEY=VALUE (shell-style)
 
@@ -1768,6 +1968,11 @@ HTPASSWD_FILE={htpasswd_path}
 # Message retention window (seconds)
 # MESSAGE_RETENTION_SECONDS=86400
 
+# Grafana webhook integration (disabled by default)
+# GRAFANA_WEBHOOK=0
+# GRAFANA_DEFAULT_NUMBER=
+# GRAFANA_MESSAGE_MAX_LENGTH=150
+
 # Configuration priority:
 # 1. Command-line arguments (highest)
 # 2. This file (/etc/default/sms-rest-server)
@@ -1776,12 +1981,35 @@ HTPASSWD_FILE={htpasswd_path}
 # After modifying this file, restart the service:
 # sudo systemctl restart sms-rest-server
 """
-            print(f"📄 Creating config file at {config_file}")
-            with open(config_file, 'w') as f:
-                f.write(config_content)
-            os.chmod(config_file, 0o644)
+
+        config_exists = os.path.exists(config_file)
+        preserve_config = False
+
+        if config_exists:
+            print(f"⚠️  Config file already exists at {config_file}")
+            while True:
+                response = input("Use previous settings? [Y/n]: ").lower().strip()
+                if response in ['', 'y', 'yes']:
+                    preserve_config = True
+                    print("   ℹ️  Preserving previous configuration settings")
+                    break
+                elif response in ['n', 'no']:
+                    print("   ℹ️  Will create fresh configuration")
+                    break
+                else:
+                    print("Please enter 'y' for yes or 'n' for no.")
+
+        if preserve_config:
+            old_settings = parse_existing_config(config_file)
+            config_content = merge_config_with_template(old_settings, config_template)
+            print(f"📄 Updating config file at {config_file} (preserving settings)")
         else:
-            print(f"⚠️  Config file already exists at {config_file}, skipping")
+            config_content = config_template
+            print(f"📄 Creating config file at {config_file}")
+
+        with open(config_file, 'w') as f:
+            f.write(config_content)
+        os.chmod(config_file, 0o644)
 
         # 8. Create systemd service file
         service_content = f"""[Unit]
@@ -1831,6 +2059,14 @@ WantedBy=multi-user.target
         print("✅ INSTALLATION COMPLETED SUCCESSFULLY!")
         print("=" * 60)
         print()
+
+        if preserve_config or (os.path.exists(htpasswd_path) and not htpasswd_created):
+            print("📋 Installation Notes:")
+            if preserve_config:
+                print("   ✅ Configuration preserved from previous installation")
+            if os.path.exists(htpasswd_path) and not htpasswd_created:
+                print("   ✅ Authentication credentials preserved")
+            print()
 
         print("🚀 Next Steps:")
         print("   1. sudo systemctl start sms-rest-server      # Start the service")
@@ -2321,10 +2557,162 @@ def get_message_status():
         timestamp_override=timestamp_source
     )
 
+
+@app.route('/inbox', methods=['GET'])
+def get_inbox():
+    authenticated, username = authenticate_request()
+    if not authenticated:
+        return jsonify({
+            'status': 'failed',
+            'error_code': 'AUTHENTICATION_REQUIRED',
+            'error_message': 'Invalid credentials or missing Authorization header'
+        }), 401
+
+    def parse_bool_param(param_names):
+        for name in param_names:
+            if name in request.args:
+                value = request.args.get(name, '').lower()
+                if value in ['', 'true', '1', 'yes']:
+                    return True
+        return False
+
+    unread_only = parse_bool_param(['unread', 'unread_only'])
+    delete_after = parse_bool_param(['delete', 'delete_after'])
+    limit = request.args.get('limit', type=int)
+
+    try:
+        sm = get_modem_connection()
+        if not sm:
+            return jsonify({
+                'status': 'failed',
+                'error_code': 'MODEM_NOT_AVAILABLE',
+                'error_message': 'Modem connection not available'
+            }), 503
+
+        all_messages = get_sms_with_locations(sm)
+
+        filtered_messages = []
+        for msg in all_messages:
+            if unread_only and msg.get('State') != 'UnRead':
+                continue
+
+            filtered_messages.append({
+                'number': msg.get('Number', ''),
+                'datetime': msg.get('DateTime').isoformat() if msg.get('DateTime') else None,
+                'text': msg.get('Text', ''),
+                'state': msg.get('State', ''),
+                'location': msg.get('Location', 0),
+                'folder': 0
+            })
+
+            if limit and len(filtered_messages) >= limit:
+                break
+
+        if delete_after and filtered_messages:
+            deleted_count = 0
+            for msg in all_messages:
+                if unread_only and msg.get('State') != 'UnRead':
+                    continue
+                try:
+                    sm.DeleteSMS(Folder=0, Location=msg['Location'])
+                    deleted_count += 1
+                except Exception as e:
+                    if debug:
+                        print(f"[INBOX] Failed to delete SMS at location {msg['Location']}: {e}")
+
+                if limit and deleted_count >= limit:
+                    break
+
+        return jsonify({
+            'status': 'success',
+            'count': len(filtered_messages),
+            'messages': filtered_messages,
+            'timestamp': format_timestamp()
+        }), 200
+
+    except Exception as e:
+        if debug:
+            import traceback
+            traceback.print_exc()
+        return jsonify({
+            'status': 'failed',
+            'error_code': 'INTERNAL_ERROR',
+            'error_message': str(e)
+        }), 500
+
+
+@app.route('/api/v1/alerts', methods=['POST'])
+def grafana_webhook_handler():
+    if not GRAFANA_WEBHOOK:
+        return jsonify({'error': 'Grafana webhook endpoint is disabled'}), 404
+
+    try:
+        client_ip = request.remote_addr
+        if debug:
+            print(f"[GRAFANA] Received webhook from {client_ip}")
+
+        if not request.is_json:
+            return jsonify({'error': 'Content-Type must be application/json'}), 400
+
+        try:
+            alerts_data = request.get_json()
+        except Exception as e:
+            return jsonify({'error': 'Invalid JSON payload', 'details': str(e)}), 400
+
+        if not isinstance(alerts_data, list):
+            return jsonify({'error': 'Expected JSON array of alerts'}), 400
+
+        if debug:
+            print(f"[GRAFANA] Processing {len(alerts_data)} alerts")
+
+        results = []
+        success_count = 0
+        error_count = 0
+
+        for i, alert in enumerate(alerts_data):
+            try:
+                result = process_grafana_alert(alert, i + 1, client_ip)
+                results.append(result)
+                if result['success']:
+                    success_count += 1
+                else:
+                    error_count += 1
+            except Exception as e:
+                if debug:
+                    import traceback
+                    traceback.print_exc()
+                results.append({
+                    'alert_index': i + 1,
+                    'success': False,
+                    'error': str(e)
+                })
+                error_count += 1
+
+        response = {
+            'status': 'completed',
+            'total_alerts': len(alerts_data),
+            'successful': success_count,
+            'failed': error_count,
+            'results': results,
+            'timestamp': format_timestamp()
+        }
+
+        if debug:
+            print(f"[GRAFANA] Processing complete: {success_count} successful, {error_count} failed")
+
+        return jsonify(response), 200 if error_count == 0 else 207
+
+    except Exception as e:
+        if debug:
+            import traceback
+            traceback.print_exc()
+        return jsonify({'error': 'Internal processing error', 'details': str(e)}), 500
+
+
 def main():
     global htpasswd_file, debug, SERVICE_PORT, modem_device, config_file
     global SMS_REPLY_TIMEOUT, REPLY_POLL_INTERVAL, TIMEOUT_SWEEP_INTERVAL, QUEUE_WAIT_SECONDS
-    global MESSAGE_RETENTION_SECONDS
+    global MESSAGE_RETENTION_SECONDS, GRAFANA_WEBHOOK, GRAFANA_DEFAULT_NUMBER, GRAFANA_MESSAGE_MAX_LENGTH
 
     port = None
     port_from_cli = False
@@ -2377,6 +2765,10 @@ def main():
     TIMEOUT_SWEEP_INTERVAL = get_int_config(config, 'TIMEOUT_SWEEP_INTERVAL', TIMEOUT_SWEEP_INTERVAL, 1)
     QUEUE_WAIT_SECONDS = get_int_config(config, 'QUEUE_WAIT_SECONDS', QUEUE_WAIT_SECONDS, 1)
     MESSAGE_RETENTION_SECONDS = get_int_config(config, 'MESSAGE_RETENTION_SECONDS', MESSAGE_RETENTION_SECONDS, 0)
+    GRAFANA_WEBHOOK = get_bool_config(config, 'GRAFANA_WEBHOOK', GRAFANA_WEBHOOK)
+    GRAFANA_MESSAGE_MAX_LENGTH = get_int_config(config, 'GRAFANA_MESSAGE_MAX_LENGTH', GRAFANA_MESSAGE_MAX_LENGTH, 50, 160)
+    if 'GRAFANA_DEFAULT_NUMBER' in config:
+        GRAFANA_DEFAULT_NUMBER = config['GRAFANA_DEFAULT_NUMBER'].strip() if config['GRAFANA_DEFAULT_NUMBER'].strip() else None
 
     for opt, arg in opts:
         if opt in ("-p", "--port"):
